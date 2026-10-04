@@ -2,7 +2,7 @@ name: CI/CD - Spring Boot DevSecOps
 
 on:
   push:
-    branches: [ main, develop, feature/**, bugfix/**, hotfix/** ]
+    branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
   # Optional: also trigger on version tags
@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  JAVA_VERSION: '25'
+  JAVA_VERSION: '21'
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}   # e.g. your-org/your-app
 
