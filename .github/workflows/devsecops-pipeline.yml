@@ -1,0 +1,263 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, develop, 'lab/**' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+  IMAGE_NAME: springboot-devsecops-lab
+  TRIVY_IMAGE: aquasec/trivy:0.74.0
+  CONFTEST_IMAGE: openpolicyagent/conftest:v0.71.0
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. CI - Compilacion y pruebas
+  # ------------------------------------------------------------------
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Build & run tests
+        run: mvn -B clean verify
+
+      - name: Upload test reports and jar
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-and-test
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+            target/*.jar
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 2. SAST - Semgrep (obligatorio)
+  # ------------------------------------------------------------------
+  sast-semgrep:
+    name: SAST - Semgrep
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep (JSON)
+        run: |
+          semgrep scan \
+            --config auto \
+            --config .semgrep.yml \
+            --json --output semgrep-report.json \
+            src/main
+
+      - name: Upload Semgrep report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 3. SCA - SBOM CycloneDX + Trivy (opcional)
+  # ------------------------------------------------------------------
+  sca-trivy:
+    name: SCA - Trivy (SBOM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Generate CycloneDX SBOM
+        run: mvn -B org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
+
+      - name: Run Trivy on SBOM (JSON)
+        run: |
+          mkdir -p reports
+          cp target/bom.json reports/bom.json
+          docker run --rm -v "$PWD/reports:/reports" "$TRIVY_IMAGE" sbom \
+            --format json --output /reports/trivy-sca-report.json \
+            /reports/bom.json
+
+      - name: Upload SCA report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-report
+          path: |
+            reports/trivy-sca-report.json
+            reports/bom.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 4. Policy as Code - Conftest sobre el Dockerfile (opcional)
+  # ------------------------------------------------------------------
+  policy-conftest:
+    name: Policy as Code - Conftest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Conftest on Dockerfile (JSON)
+        run: |
+          # El resultado se evalua en el Security Gate; aqui solo se genera el reporte.
+          docker run --rm -v "$PWD:/project" -w /project "$CONFTEST_IMAGE" \
+            test Dockerfile --policy policy/dockerfile --output json \
+            > conftest-report.json || true
+          cat conftest-report.json
+
+      - name: Upload Conftest report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conftest-report
+          path: conftest-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # 5. Imagen del proyecto: build + analisis con Trivy (obligatorio)
+  # ------------------------------------------------------------------
+  image-build-scan:
+    name: Image - Build & Trivy
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build project image
+        run: |
+          docker build \
+            -t "$IMAGE_NAME:${{ github.sha }}" \
+            -t "$IMAGE_NAME:ci" .
+
+      - name: Run Trivy on project image (JSON)
+        run: |
+          mkdir -p reports
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/reports:/reports" "$TRIVY_IMAGE" image \
+            --scanners vuln \
+            --format json --output /reports/trivy-report.json \
+            "$IMAGE_NAME:${{ github.sha }}"
+
+      - name: Upload Trivy image report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-report
+          path: reports/trivy-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Export image for local deployment
+        run: docker save "$IMAGE_NAME:${{ github.sha }}" | gzip > app-image.tar.gz
+
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-image
+          path: app-image.tar.gz
+          compression-level: 0
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # 6. Security Gate - consolida reportes y aplica umbrales
+  # ------------------------------------------------------------------
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [build-and-test, sast-semgrep, sca-trivy, policy-conftest, image-build-scan]
+    if: always()
+    steps:
+      - name: Download reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-report'
+          path: reports
+          merge-multiple: true
+
+      - name: Upload consolidated reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: devsecops-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Evaluate thresholds
+        run: |
+          FAIL=0
+          count() { [[ -s "$2" ]] && jq "$1" "$2" || echo "n/d"; }
+          trivy_sev() { count "[.Results[]?.Vulnerabilities[]? | select(.Severity == \"$1\")] | length" "$2"; }
+
+          SEMGREP_ERROR=$(count '[.results[] | select(.extra.severity == "ERROR")] | length' reports/semgrep-report.json)
+          SEMGREP_WARN=$(count '[.results[] | select(.extra.severity == "WARNING")] | length' reports/semgrep-report.json)
+          IMG_CRIT=$(trivy_sev CRITICAL reports/trivy-report.json)
+          IMG_HIGH=$(trivy_sev HIGH reports/trivy-report.json)
+          SCA_CRIT=$(trivy_sev CRITICAL reports/trivy-sca-report.json)
+          SCA_HIGH=$(trivy_sev HIGH reports/trivy-sca-report.json)
+          POLICY_FAIL=$(count '[.[].failures[]?] | length' reports/conftest-report.json)
+          POLICY_WARN=$(count '[.[].warnings[]?] | length' reports/conftest-report.json)
+
+          {
+            echo "## Security Gate"
+            echo "Commit: \`${{ github.sha }}\`"
+            echo
+            echo "| Control | Herramienta | Resultado | Bloquea si |"
+            echo "|---|---|---|---|"
+            echo "| Build & Test | Maven | ${{ needs.build-and-test.result }} | falla |"
+            echo "| SAST | Semgrep | $SEMGREP_ERROR ERROR / $SEMGREP_WARN WARNING | ERROR > 0 |"
+            echo "| Imagen | Trivy image | $IMG_CRIT CRITICAL / $IMG_HIGH HIGH | CRITICAL > 0 |"
+            echo "| SCA | Trivy sbom | $SCA_CRIT CRITICAL / $SCA_HIGH HIGH | informativo |"
+            echo "| Policy as Code | Conftest | $POLICY_FAIL fallas / $POLICY_WARN avisos | fallas > 0 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${{ needs.build-and-test.result }}" != "success" ]]; then
+            echo "::error::Build o pruebas fallidas"; FAIL=1
+          fi
+          for v in SEMGREP_ERROR IMG_CRIT POLICY_FAIL; do
+            if [[ "${!v}" == "n/d" ]]; then
+              echo "::error::Reporte no disponible para $v"; FAIL=1
+            elif (( ${!v} > 0 )); then
+              echo "::error::$v = ${!v} supera el umbral"; FAIL=1
+            fi
+          done
+
+          if (( FAIL == 1 )); then
+            echo "Security gate failed (los reportes quedan publicados como artifacts)"
+            exit 1
+          fi
+          echo "Security gate passed"

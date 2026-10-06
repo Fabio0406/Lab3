@@ -1,0 +1,15 @@
+# CD local: despliega la imagen construida por el pipeline (o una local).
+services:
+  app:
+    image: ${APP_IMAGE:-springboot-devsecops-lab:local}
+    container_name: springboot-devsecops-lab
+    ports:
+      - "127.0.0.1:8080:8080"   # solo localhost: la aplicacion es deliberadamente vulnerable
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
