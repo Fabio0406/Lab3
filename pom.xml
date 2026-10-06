@@ -44,11 +44,11 @@
             <scope>runtime</scope>
         </dependency>
 
-        <!-- Dependencia desactualizada agregada solo para el laboratorio SCA. -->
+        <!-- Actualizada desde 1.9 (CVE-2022-42889) en el laboratorio SCA. -->
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-text</artifactId>
-            <version>1.9</version>
+            <version>1.15.0</version>
         </dependency>
 
         <dependency>
